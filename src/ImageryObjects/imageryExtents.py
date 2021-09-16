@@ -14,7 +14,7 @@ import numpy as np
 
 from datetime import datetime
 from functools import partial
-from shapely.geometry import Polygon, LineString, Point
+from shapely.geometry import Polygon, LineString, Point, box
 from PIL import Image
 from shapely.ops import transform
 from zipfile import ZipFile
@@ -25,13 +25,14 @@ vendorInformation = {
     "Maxar":{'browseTag':'BROWSE.JPG'},
     'SPOT':{'browseTag':'PREVIEW'},
     'GOST':{'browseTag':''},
-    'gbdx_clip':{'browseTag:'}
+    'gbdx_clip':{'browseTag':''},
+    'Airbus':{'browseTag':'PREVIEW_*.JPG'}
 }
-allFileTypes = ["TIF", "tif"]
+allFileTypes = ["TIF", "tif", 'JP2']
 
 class deliveredImageryFolder(object):
 
-    def __init__(self, inputFolder, outputFolder, adminBoundaries, vendor = ''):
+    def __init__(self, inputFolder, outputFolder, adminBoundaries, vendor = '', metadata=''):
         ''' Generate metadata for input images in folder
         
         Parameters:
@@ -46,7 +47,10 @@ class deliveredImageryFolder(object):
         else:
             self.vendor = vendor        
         if self.vendor == "gbdx_clip":
-            self.process_gbdx_xml()        
+            self.process_gbdx_xml()                    
+        if metadata.__class__ == gpd.geodataframe.GeoDataFrame:
+            self.allMetadata = metadata
+            
         self.adminBoundaries = adminBoundaries
         self.findImages()
         self.zipFile = os.path.join(outputFolder, "%s.zip" % self.generateFilename()) 
@@ -83,6 +87,14 @@ class deliveredImageryFolder(object):
         for f in inFiles:
             if f[-10:] == "BROWSE.JPG":
                 return("MAXAR")
+            if ("PHR1A" in f) or ("PHR1B" in f):
+                return("Airbus")            
+            if f[:2] == "K5":
+                return("SIIS")
+            if "SPOT" in f:
+                return("SPOT")
+            if f[:3] == "BSG":
+                return("Blacksky")
     
     def createJSON(self, pNumber, securityClassification="Official Use Only"):
         if not os.path.exists(self.jsonFile):
@@ -96,7 +108,7 @@ class deliveredImageryFolder(object):
                 "iso3":self.countryISO3,
                 "location":self.zipFile,
                 "zippedSize":zippedSize,
-                "resolution":",".join([str(x) for x in np.unique([m['Res'].min(), m['Res'].max()])]),
+                "resolution":",".join([str(round(x, 3)) for x in np.unique([m['Res'].min(), m['Res'].max()])]),
                 "nBands":",".join([str(x) for x in np.unique([m['Bands'].min(), m['Bands'].max()])]),
                 "vendor":self.vendor,
                 "capture_date":",".join([str(x) for x in np.unique([m['Date'].min(), m['Date'].max()])]),
@@ -124,10 +136,11 @@ class deliveredImageryFolder(object):
     
     def getDate(self, file):
         ''' Get date of image, depending on Vendor
-        '''
+        '''        
         try:
             return(self.Date)
         except:
+            file = os.path.basename(file)
             cDate = "YYYYMMDD"
             if self.vendor == "MAXAR":
                 try:
@@ -136,6 +149,14 @@ class deliveredImageryFolder(object):
                     cDate = dTime.strftime("%Y%m%d")                    
                 except:
                     logging.warning("Could not determine date for %s" % file)                    
+            if self.vendor == "SIIS":
+                cDate = file.split("_")[1][:8]       
+            if self.vendor == "Airbus":
+                cDate = file.split("_")[3][:8]
+            if self.vendor == "SPOT":
+                cDate = file.split("_")[3][:8]                 
+            if self.vendor == "Blacksky":
+                cDate = file.split("-")[2][:8]            
             self.Date = cDate
             return(self.Date)
     
@@ -147,8 +168,16 @@ class deliveredImageryFolder(object):
         inputExtent = allM.unary_union
         
         country = self.adminBoundaries[self.adminBoundaries.intersects(inputExtent)]
-        self.countryName = ";".join(country['WB_ADM0_NA'])
-        self.countryISO3 = ";".join(country['ISO3'])    
+        if country.shape[0] > 1:
+            # If more than one country is intersected, select the shape with the highest overlap
+            country['OVERLAP'] = country['geometry'].apply(lambda x: x.intersection(inputExtent).area/inputExtent.area)           
+            country = country.sort_values('OVERLAP', ascending=False).iloc[0]
+            self.countryName = country['WB_ADM0_NA']
+            self.countryISO3 = country['ISO3']
+
+        else:
+            self.countryName = ";".join(country['WB_ADM0_NA'])
+            self.countryISO3 = ";".join(country['ISO3'])    
         
     def getMetadata(self):
         ''' Generate metadata dataframe for every image
@@ -157,34 +186,28 @@ class deliveredImageryFolder(object):
             return(self.allMetadata)
         except:        
             allRes = []
-            for x in self.allImages:            
+            for x in self.allImages:
                 curRaster = rasterio.open(x)          
                 #Extract imagery extent
                 if curRaster.crs:
                     crs = curRaster.crs
                     b = curRaster.bounds
-                    bbox = [[b.left, b.bottom],
-                            [b.left, b.top],
-                            [b.right, b.top],
-                            [b.right, b.bottom],
-                            [b.left, b.bottom]]
-                    bbox = Polygon(bbox)
-                    project = partial(
-                        pyproj.transform,
-                        pyproj.Proj(init=str(crs)), # source coordinate system
-                        pyproj.Proj(init='epsg:4326')) # destination coordinate system
+                    bbox = box(*b)
+                    project = pyproj.Transformer.from_crs(
+                        pyproj.CRS(str(crs)), 
+                        pyproj.CRS('epsg:4326'), 
+                        always_xy=True).transform
                     res = curRaster.res[0]
-                    bbox2 = transform(project, bbox)               
+                    bbox2 = transform(project, bbox) 
                     #Need to transform resolution to a meters measure
                     if curRaster.crs.to_epsg() == 4326:                        
                         project = partial(
                             pyproj.transform,
-                            pyproj.Proj(init='epsg:4326'), # source coordinate system
-                            pyproj.Proj(init='epsg:3857')) # destination coordinate system
+                            pyproj.Proj('epsg:4326'), # source coordinate system
+                            pyproj.Proj('epsg:3857')) # destination coordinate system
                         l = LineString([Point(0,0), Point(0,res)])
                         l = transform(project, l)
                         res = l.length
-                        
                     allRes.append([curRaster.count, round(res, 3), 
                                     bbox2, geohash.encode(bbox2.centroid.y, bbox2.centroid.x), 
                                     curRaster.shape[0], curRaster.shape[1], self.getDate(x), x])
@@ -192,7 +215,7 @@ class deliveredImageryFolder(object):
             #create output metadata dataFrame
             if len(allRes) > 0:
                 allMetadata = pd.DataFrame(allRes, columns=["Bands", "Res", "geometry", "geohash", "columns", "rows", "Date","file"])
-                allMetadata = gpd.GeoDataFrame(allMetadata, geometry="geometry", crs=pyproj.Proj(init='epsg:4326'))
+                allMetadata = gpd.GeoDataFrame(allMetadata, geometry="geometry", crs=pyproj.CRS('epsg:4326'))
                 if allMetadata.iloc[0]['Date'] == "YYYYMMDD":
                     try:
                         allMetadata['Date'] = self.Date
@@ -220,12 +243,15 @@ class deliveredImageryFolder(object):
             except:
                 gHash = "XXXXXXXXX"
             # Generate a filename 
-            outString = "{ISO3}_{gHash}_{bands}_{res}_{curDate}".format(
+            outString = r"{ISO3}_{gHash}_{bands}_{res}_{curDate}".format(
                 ISO3 = self.countryISO3,
                 gHash = gHash,
-                res = ",".join([str(x) for x in np.unique([allM['Res'].min(), allM['Res'].max()])]),
-                bands = ",".join([str(x) for x in np.unique([allM['Bands'].min(), allM['Bands'].max()])]),
-                curDate = ",".join([str(x) for x in np.unique([allM['Date'].min(), allM['Date'].max()])])
+                #res = ",".join([str(x) for x in np.unique([allM['Res'].min(), allM['Res'].max()])]),
+                res = str(allM['Res'].min()),
+                #bands = ",".join([str(x) for x in np.unique([allM['Bands'].min(), allM['Bands'].max()])]),
+                bands = str(allM['Bands'].max()),
+                #curDate = ",".join([str(x) for x in np.unique([allM['Date'].min(), allM['Date'].max()])])
+                curDate = str(allM['Date'].max())
             )
             self.fileName = outString
         return(self.fileName)
